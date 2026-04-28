@@ -2,6 +2,11 @@ package eu.kanade.tachiyomi.multisrc.mangabox
 
 import android.annotation.SuppressLint
 import android.content.SharedPreferences
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.util.Base64
+import androidx.preference.CheckBoxPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
@@ -12,6 +17,7 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
+import keiyoushi.lib.dataimage.DataImageInterceptor
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
@@ -19,17 +25,18 @@ import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okio.IOException
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 import java.util.regex.Pattern
-import kotlin.text.split
 
 abstract class MangaBox(
     override val name: String,
@@ -50,9 +57,12 @@ abstract class MangaBox(
 
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .addInterceptor(::useAltCdnInterceptor)
+        .addInterceptor(DataImageInterceptor())
         .build()
 
     private fun SharedPreferences.getMirrorPref(): String = getString(PREF_USE_MIRROR, mirrorEntries[0])!!
+
+    private fun SharedPreferences.getMergeImagesPref(): Boolean = getBoolean(PREF_MERGE_IMAGES, false)
 
     private val preferences: SharedPreferences by getPreferencesLazy {
         // if current mirror is not in mirrorEntries, set default
@@ -68,6 +78,16 @@ abstract class MangaBox(
             }
 
             field = preferences.getMirrorPref()
+            return field
+        }
+
+    private var mergeImages: Boolean? = null
+        get() {
+            if (field != null) {
+                return field
+            }
+
+            field = preferences.getMergeImagesPref()
             return field
         }
 
@@ -374,6 +394,18 @@ abstract class MangaBox(
         return arrayValues
     }
 
+    private fun getByteArray(imageUrl: String): ByteArray = client.newCall(
+        GET(imageUrl, headers).newBuilder()
+            .tag(MangaBoxFallBackTag::class.java, MangaBoxFallBackTag()).build(),
+    ).execute().body.bytes()
+
+    private fun bitmapToObjectURL(bmp: Bitmap): String {
+        val stream = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.PNG, 100, stream)
+        val base64 = Base64.encodeToString(stream.toByteArray(), Base64.DEFAULT)
+        return "https://127.0.0.1/?image/png;base64,$base64"
+    }
+
     override fun pageListParse(document: Document): List<Page> {
         val content = document.select("script:containsData(cdns =)").joinToString("\n") { it.data() }
         val cdns =
@@ -383,23 +415,82 @@ abstract class MangaBox(
         // Add all parsed cdns to set
         cdnSet.addAll(cdns)
 
-        return chapterImages.mapIndexed { i, imagePath ->
-            val parsedUrl = cdns[0].toHttpUrl().run {
-                newBuilder()
-                    .encodedPath(
-                        "/$imagePath".replace(
-                            "//",
-                            "/",
-                        ),
-                    ) // replace ensures that there's at least one trailing slash prefix
-                    .build()
-                    .toString()
+        return if (mergeImages == true) {
+            val images = chapterImages.map { imagePath ->
+                getByteArray(
+                    cdns[0].toHttpUrl().run {
+                        newBuilder()
+                            .encodedPath(
+                                "/$imagePath".replace(
+                                    "//",
+                                    "/",
+                                ),
+                            ) // replace ensures that there's at least one trailing slash prefix
+                            .build()
+                            .toString()
+                    },
+                )
+            }.ifEmpty {
+                document.select("div.container-chapter-reader > img").map { img ->
+                    getByteArray(img.absUrl("src"))
+                }
             }
 
-            Page(i, document.location(), parsedUrl)
-        }.ifEmpty {
-            document.select("div.container-chapter-reader > img").mapIndexed { i, img ->
-                Page(i, imageUrl = img.absUrl("src"))
+            val pageList = mutableListOf<Page>()
+
+            var prev: Bitmap? = null
+
+            for (image in images) {
+                val curr = BitmapFactory.decodeByteArray(image, 0, image.size)
+                if (prev != null) {
+                    if (curr.width == prev.width && curr.width > 4 * curr.height) {
+                        val cs = Bitmap.createBitmap(prev.width, prev.height + curr.height, prev.config)
+
+                        val canvas = Canvas(cs)
+                        canvas.drawBitmap(prev, 0f, 0f, null)
+                        canvas.drawBitmap(curr, 0f, prev.height.toFloat(), null)
+
+                        pageList.add(Page(pageList.size, imageUrl = bitmapToObjectURL(cs)))
+                        prev = null
+                    } else {
+                        pageList.add(Page(pageList.size, imageUrl = bitmapToObjectURL(prev)))
+                        prev = curr
+                    }
+                } else {
+                    prev = curr
+                }
+            }
+
+            if (prev != null) {
+                pageList.add(Page(pageList.size, imageUrl = bitmapToObjectURL(prev)))
+            }
+
+            pageList
+        } else {
+            chapterImages.mapIndexed { i, imagePath ->
+                Page(
+                    i,
+                    document.location(),
+                    cdns[0].toHttpUrl().run {
+                        newBuilder()
+                            .encodedPath(
+                                "/$imagePath".replace(
+                                    "//",
+                                    "/",
+                                ),
+                            ) // replace ensures that there's at least one trailing slash prefix
+                            .build()
+                            .toString()
+                    },
+                )
+            }.ifEmpty {
+                document.select("div.container-chapter-reader > img").mapIndexed { i, img ->
+                    Page(
+                        i,
+                        document.location(),
+                        img.absUrl("src"),
+                    )
+                }
             }
         }
     }
@@ -517,10 +608,24 @@ abstract class MangaBox(
                 true
             }
         }.let(screen::addPreference)
+
+        CheckBoxPreference(screen.context).apply {
+            key = PREF_MERGE_IMAGES
+            title = "Merge Images"
+            summary = "Merge split images. All images in the chapter will be loaded before they are displayed (no lazy loading)."
+            setDefaultValue(false)
+
+            setOnPreferenceChangeListener { _, newValue ->
+                // Update values
+                mergeImages = newValue as Boolean
+                true
+            }
+        }.let(screen::addPreference)
     }
 
     companion object {
         private const val PREF_USE_MIRROR = "pref_use_mirror"
+        private const val PREF_MERGE_IMAGES = "pref_merge_images"
         private const val CHAPTER_LIST_TAKE = 1000
         private const val URL_PREFIX = "https://"
     }
