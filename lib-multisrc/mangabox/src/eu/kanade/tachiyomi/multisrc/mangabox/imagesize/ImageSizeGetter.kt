@@ -1,4 +1,4 @@
-package keiyoushi.lib.imagesize
+package eu.kanade.tachiyomi.multisrc.mangabox.imagesize
 
 import java.io.InputStream
 
