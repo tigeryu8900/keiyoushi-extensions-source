@@ -5,7 +5,6 @@ import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
-import android.util.Base64
 import androidx.preference.CheckBoxPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -17,18 +16,22 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
-import keiyoushi.lib.dataimage.DataImageInterceptor
+import keiyoushi.lib.imagesize.WebpSizeGetter
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.IOException
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -36,6 +39,7 @@ import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.CountDownLatch
 import java.util.regex.Pattern
 
 abstract class MangaBox(
@@ -56,8 +60,8 @@ abstract class MangaBox(
     override val baseUrl: String get() = mirror
 
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .addInterceptor(::mergeImagesInterceptor)
         .addInterceptor(::useAltCdnInterceptor)
-        .addInterceptor(DataImageInterceptor())
         .build()
 
     private fun SharedPreferences.getMirrorPref(): String = getString(PREF_USE_MIRROR, mirrorEntries[0])!!
@@ -108,6 +112,50 @@ abstract class MangaBox(
             else -> ":${this.port}"
         }
     }"
+
+    private fun mergeImagesInterceptor(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val url = request.url
+
+        if (url.toString().startsWith("https://127.0.0.1/merge?")) {
+            val first = url.queryParameter("1")!!
+            val second = url.queryParameter("2")!!
+            val w = url.queryParameter("w")!!.toInt()
+            val m = url.queryParameter("m")!!.toInt()
+            val h = url.queryParameter("h")!!.toInt()
+
+            val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+
+            try {
+                val canvas = Canvas(result)
+
+                val firstBitmap = BitmapFactory.decodeStream(chain.proceed(request.newBuilder().url(first).build()).body.byteStream())
+                canvas.drawBitmap(firstBitmap, 0f, 0f, null)
+                firstBitmap.recycle()
+
+                val secondBitmap = BitmapFactory.decodeStream(chain.proceed(request.newBuilder().url(second).build()).body.byteStream())
+                canvas.drawBitmap(secondBitmap, 0f, m.toFloat(), null)
+                secondBitmap.recycle()
+
+                return Response.Builder().body(
+                    ByteArrayOutputStream()
+                        .also {
+                            result.compress(Bitmap.CompressFormat.WEBP, 100, it)
+                        }
+                        .toByteArray().toResponseBody("image/webp".toMediaType()),
+                )
+                    .request(request)
+                    .protocol(Protocol.HTTP_1_0)
+                    .code(200)
+                    .message("")
+                    .build()
+            } finally {
+                result.recycle()
+            }
+        } else {
+            return chain.proceed(request)
+        }
+    }
 
     private fun useAltCdnInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -319,7 +367,9 @@ abstract class MangaBox(
             val baseChapterListUrl = apiChapterListUrl.replace("__SLUG__", slug)
 
             while (true) {
-                val nextPageResponse = client.newCall(GET("$baseChapterListUrl?limit=$CHAPTER_LIST_TAKE&offset=${CHAPTER_LIST_TAKE * offsetMultiple}")).execute().parseAs<ApiResponse>()
+                val nextPageResponse =
+                    client.newCall(GET("$baseChapterListUrl?limit=$CHAPTER_LIST_TAKE&offset=${CHAPTER_LIST_TAKE * offsetMultiple}"))
+                        .execute().parseAs<ApiResponse>()
 
                 rawChaptersList.addAll(nextPageResponse.data.chapters)
 
@@ -394,18 +444,6 @@ abstract class MangaBox(
         return arrayValues
     }
 
-    private fun getByteArray(imageUrl: String): ByteArray = client.newCall(
-        GET(imageUrl, headers).newBuilder()
-            .tag(MangaBoxFallBackTag::class.java, MangaBoxFallBackTag()).build(),
-    ).execute().body.bytes()
-
-    private fun bitmapToObjectURL(bmp: Bitmap): String {
-        val stream = ByteArrayOutputStream()
-        bmp.compress(Bitmap.CompressFormat.PNG, 100, stream)
-        val base64 = Base64.encodeToString(stream.toByteArray(), Base64.DEFAULT)
-        return "https://127.0.0.1/?image/png;base64,$base64"
-    }
-
     override fun pageListParse(document: Document): List<Page> {
         val content = document.select("script:containsData(cdns =)").joinToString("\n") { it.data() }
         val cdns =
@@ -415,83 +453,94 @@ abstract class MangaBox(
         // Add all parsed cdns to set
         cdnSet.addAll(cdns)
 
+        val (numImages, imageUrls) = if (chapterImages.isNotEmpty()) {
+            val httpUrl = cdns[0].toHttpUrl()
+            Pair(
+                chapterImages.size,
+                chapterImages.asSequence().map { imagePath ->
+                    httpUrl
+                        .newBuilder()
+                        .encodedPath(
+                            "/$imagePath".replace(
+                                "//",
+                                "/",
+                            ),
+                        ) // replace ensures that there's at least one trailing slash prefix
+                        .build()
+                        .toString()
+                },
+            )
+        } else {
+            val elements = document.select("div.container-chapter-reader > img")
+            Pair(
+                elements.size,
+                document.select("div.container-chapter-reader > img").asSequence().map { img ->
+                    img.absUrl("src")
+                },
+            )
+        }
+
         return if (mergeImages == true) {
-            val images = chapterImages.map { imagePath ->
-                getByteArray(
-                    cdns[0].toHttpUrl().run {
-                        newBuilder()
-                            .encodedPath(
-                                "/$imagePath".replace(
-                                    "//",
-                                    "/",
-                                ),
-                            ) // replace ensures that there's at least one trailing slash prefix
-                            .build()
-                            .toString()
+            val latch = CountDownLatch(numImages)
+            val sizes = MutableList<Pair<Int, Int>?>(numImages) { null }
+            val headers = headersBuilder().set("Range", "bytes=0-1023").build()
+
+            imageUrls.forEachIndexed { i, url ->
+                client.newCall(
+                    GET(url, headers).newBuilder()
+                        .tag(MangaBoxFallBackTag::class.java, MangaBoxFallBackTag()).build(),
+                ).enqueue(
+                    object : Callback {
+                        override fun onFailure(call: Call, e: IOException) {
+                            latch.countDown()
+                        }
+
+                        override fun onResponse(call: Call, response: Response) {
+                            sizes[i] = WebpSizeGetter(response.body.byteStream()).get()
+                            latch.countDown()
+                        }
                     },
                 )
-            }.ifEmpty {
-                document.select("div.container-chapter-reader > img").map { img ->
-                    getByteArray(img.absUrl("src"))
-                }
             }
 
+            latch.await()
+
+            var prevSize: Pair<Int, Int>? = null
             val pageList = mutableListOf<Page>()
 
-            var prev: Bitmap? = null
+            val httpUrl = "https://127.0.0.1/merge".toHttpUrl()
 
-            for (image in images) {
-                val curr = BitmapFactory.decodeByteArray(image, 0, image.size)
-                if (prev != null) {
-                    if (curr.width == prev.width && curr.width > 4 * curr.height) {
-                        val cs = Bitmap.createBitmap(prev.width, prev.height + curr.height, prev.config)
-
-                        val canvas = Canvas(cs)
-                        canvas.drawBitmap(prev, 0f, 0f, null)
-                        canvas.drawBitmap(curr, 0f, prev.height.toFloat(), null)
-
-                        pageList.add(Page(pageList.size, imageUrl = bitmapToObjectURL(cs)))
-                        prev = null
-                    } else {
-                        pageList.add(Page(pageList.size, imageUrl = bitmapToObjectURL(prev)))
-                        prev = curr
-                    }
+            for ((url, size) in imageUrls.zip(sizes.asSequence())) {
+                if (size != null && prevSize != null && size.first == prevSize.first && size.first > 4 * size.second) {
+                    pageList.last().imageUrl = httpUrl.newBuilder()
+                        .setQueryParameter("1", pageList.last().imageUrl)
+                        .setQueryParameter("2", url)
+                        .setQueryParameter("w", prevSize.first.toString())
+                        .setQueryParameter("m", prevSize.second.toString())
+                        .setQueryParameter("h", (prevSize.second + size.second).toString())
+                        .build().toString()
+                    prevSize = null
                 } else {
-                    prev = curr
+                    pageList.add(
+                        Page(
+                            pageList.size,
+                            document.location(),
+                            url,
+                        ),
+                    )
+                    prevSize = size
                 }
-            }
-
-            if (prev != null) {
-                pageList.add(Page(pageList.size, imageUrl = bitmapToObjectURL(prev)))
             }
 
             pageList
         } else {
-            chapterImages.mapIndexed { i, imagePath ->
+            imageUrls.mapIndexed { i, url ->
                 Page(
                     i,
                     document.location(),
-                    cdns[0].toHttpUrl().run {
-                        newBuilder()
-                            .encodedPath(
-                                "/$imagePath".replace(
-                                    "//",
-                                    "/",
-                                ),
-                            ) // replace ensures that there's at least one trailing slash prefix
-                            .build()
-                            .toString()
-                    },
+                    url,
                 )
-            }.ifEmpty {
-                document.select("div.container-chapter-reader > img").mapIndexed { i, img ->
-                    Page(
-                        i,
-                        document.location(),
-                        img.absUrl("src"),
-                    )
-                }
-            }
+            }.toList()
         }
     }
 
@@ -611,8 +660,8 @@ abstract class MangaBox(
 
         CheckBoxPreference(screen.context).apply {
             key = PREF_MERGE_IMAGES
-            title = "Merge Images"
-            summary = "Merge split images. All images in the chapter will be loaded before they are displayed (no lazy loading)."
+            title = "Merge Split Images"
+            summary = "Images ares sometimes split vertically. This setting enables detecting and merging split images."
             setDefaultValue(false)
 
             setOnPreferenceChangeListener { _, newValue ->
