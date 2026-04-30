@@ -8,6 +8,7 @@ import android.graphics.Canvas
 import androidx.preference.CheckBoxPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
+import eu.kanade.tachiyomi.multisrc.mangabox.imagesize.ImageSize
 import eu.kanade.tachiyomi.multisrc.mangabox.imagesize.WebpSizeGetter
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.ConfigurableSource
@@ -494,8 +495,8 @@ abstract class MangaBox(
 
         return if (mergeImages == true) {
             val latch = CountDownLatch(numImages)
-            val sizes = MutableList<Pair<Int, Int>?>(numImages) { null }
-            val headers = headersBuilder().set("Range", "bytes=0-29").build()
+            val sizes = MutableList<ImageSize?>(numImages) { null }
+            val headers = headersBuilder().set("Range", WebpSizeGetter.RANGE).build()
 
             imageUrls.forEachIndexed { i, url ->
                 client.newCall(
@@ -530,16 +531,16 @@ abstract class MangaBox(
                     prevSize != null &&
 
                     // widths are equal
-                    size.first == prevSize.first &&
+                    size.w == prevSize.w &&
 
                     // previous image is not a double page spread
-                    (prevSize.first.toFloat() / prevSize.second.toFloat() - 1.40625f).absoluteValue > 0.01f &&
+                    (prevSize.w.toFloat() / prevSize.h.toFloat() - 1.40625f).absoluteValue > 0.01f &&
 
                     // merged image is not too long
-                    prevSize.first.toFloat() / (prevSize.second + size.second).toFloat() > 0.703125f - 0.005f
+                    prevSize.w.toFloat() / (prevSize.h + size.h).toFloat() > 0.703125f - 0.005f
                 ) {
                     prev.urls.add(url)
-                    prev.size = Pair(prevSize.first, prevSize.second + size.second)
+                    prevSize.h += size.h
                 } else {
                     imageList.add(MergeImage(mutableListOf(url), size))
                 }
@@ -706,22 +707,20 @@ abstract class MangaBox(
 
 private class MergeImage(
     val urls: MutableList<String>,
-    var size: Pair<Int, Int>?,
+    val size: ImageSize?,
 ) {
     override fun toString(): String {
         if (urls.size == 1) {
             return urls[0]
         }
 
-        val builder = HTTP_URL.newBuilder()
+        val (w, h) = size!!
 
-        size?.let {
-            builder
-                .addQueryParameter("w", it.first.toString())
-                .addQueryParameter("h", it.second.toString())
-        }
-
-        builder.addQueryParameter("length", urls.size.toString())
+        val builder = HTTP_URL
+            .newBuilder()
+            .addQueryParameter("w", w.toString())
+            .addQueryParameter("h", h.toString())
+            .addQueryParameter("length", urls.size.toString())
 
         urls.forEachIndexed { i, url ->
             builder.addQueryParameter(i.toString(), url)
