@@ -375,7 +375,12 @@ abstract class MangaBox(
 
             while (true) {
                 val nextPageResponse =
-                    client.newCall(GET("$baseChapterListUrl?limit=$CHAPTER_LIST_TAKE&offset=${CHAPTER_LIST_TAKE * offsetMultiple}", headers))
+                    client.newCall(
+                        GET(
+                            "$baseChapterListUrl?limit=$CHAPTER_LIST_TAKE&offset=${CHAPTER_LIST_TAKE * offsetMultiple}",
+                            headers,
+                        ),
+                    )
                         .execute().parseAs<ApiResponse>()
 
                 rawChaptersList.addAll(nextPageResponse.data.chapters)
@@ -541,7 +546,11 @@ abstract class MangaBox(
             }
 
             imageList.mapIndexed { i, image ->
-                Page(i, document.location(), image.toString())
+                Page(
+                    i,
+                    document.location(),
+                    image.toString(),
+                )
             }
         } else {
             imageUrls.mapIndexed { i, url ->
@@ -648,7 +657,8 @@ abstract class MangaBox(
         Pair("yuri", "Yuri"),
     )
 
-    open class UriPartFilter(displayName: String, private val vals: Array<Pair<String?, String>>) : Filter.Select<String>(displayName, vals.map { it.second }.toTypedArray()) {
+    open class UriPartFilter(displayName: String, private val vals: Array<Pair<String?, String>>) :
+        Filter.Select<String>(displayName, vals.map { it.second }.toTypedArray()) {
         fun toUriPart() = vals[state].first
     }
 
@@ -671,7 +681,9 @@ abstract class MangaBox(
         CheckBoxPreference(screen.context).apply {
             key = PREF_MERGE_IMAGES
             title = "Merge Split Images"
-            summary = "Images ares sometimes split vertically. This setting enables detecting and merging split images."
+            summary = "Images are sometimes split vertically. " +
+                "This setting enables detecting and merging split images. " +
+                "Note that this isn't 100% accurate."
             setDefaultValue(false)
 
             setOnPreferenceChangeListener { _, newValue ->
